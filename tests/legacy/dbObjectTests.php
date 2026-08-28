@@ -1,12 +1,12 @@
 <?php
 error_reporting (E_ALL);
-require_once ("../MysqliDb.php");
-require_once ("../dbObject.php");
+require_once (__DIR__ . "/../../MysqliDb.php");
+require_once (__DIR__ . "/../../dbObject.php");
 
 $db = new Mysqlidb('localhost', 'root', 'root', 'testdb');
 $prefix = 't_';
 $db->setPrefix($prefix);
-dbObject::autoload ("models");
+dbObject::autoload (__DIR__ . "/models");
 
 $tables = Array (
     'users' => Array (

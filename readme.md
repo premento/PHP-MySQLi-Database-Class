@@ -26,6 +26,8 @@ MysqliDb -- Simple MySQLi wrapper and object mapper with prepared statements
 **[Transaction Helpers](#transaction-helpers)**  
 **[Error Helpers](#error-helpers)**  
 **[Table Locking](#table-locking)**  
+**[Requirements](#requirements)**  
+**[Running the tests](#running-the-tests)**  
 
 ## Support Me
 
@@ -34,6 +36,14 @@ This software is developed during my free time and I will be glad if somebody wi
 Everyone's time should be valuable, so please consider donating.
 
 [Donate with paypal](https://www.paypal.com/cgi-bin/webscr?cmd=_donations&business=a%2ebutenka%40gmail%2ecom&lc=DO&item_name=mysqlidb&currency_code=USD&bn=PP%2dDonationsBF%3abtn_donateCC_LG%2egif%3aNonHosted)
+
+### Requirements
+* PHP 8.3 or newer
+* The `mysqli` extension
+
+Since PHP 8.1, mysqli reports errors by throwing `mysqli_sql_exception` rather than
+returning `false`. This library handles both modes internally and always surfaces
+failures as its own `Exception`, so you do not need to call `mysqli_report()` yourself.
 
 ### Installation
 To utilize this class, first import MysqliDb.php into your project, and require it.
@@ -391,6 +401,28 @@ foreach ($users as $user) {
     print_r ($user);
 }
 ```
+
+#### Table prefixes in raw queries
+When a table prefix is configured, `rawQuery()` adds it to the table names that follow
+`FROM`, `INTO`, `UPDATE`, `JOIN` and `DESCRIBE`. The query is scanned rather than
+search/replaced, so the following are left untouched:
+
+* string literals, quoted identifiers, and `--`, `#` and `/* */` comments;
+* `ON DUPLICATE KEY UPDATE`, which is not an UPDATE statement;
+* schema qualified names such as `otherdb.users`, where the schema is already explicit;
+* names that already begin with the prefix, so a query written with the prefix in it is
+  not prefixed twice.
+
+```php
+$db->setPrefix ('my_');
+$db->rawQuery ("SELECT * FROM users WHERE note = 'update me'");
+// SELECT * FROM `my_users` WHERE note = 'update me'
+
+// Already prefixed, left alone:
+$db->rawQuery ('SELECT * FROM my_users');
+```
+
+With no prefix configured, `rawQuery()` passes the query through unchanged.
 To avoid long if checks there are couple helper functions to work with raw query select results:
 
 Get 1 row of results:
@@ -533,6 +565,19 @@ $res = $db->get ("users");
 // Gives: SELECT * FROM users WHERE (id = 6 or id = 2) and login='mike';
 ```
 
+**How an array value is interpreted.** `where()` and `having()` treat an array value one
+of two ways, decided by its first key:
+
+| Value | Meaning |
+| --- | --- |
+| `Array ('>=' => 50)` — string key | operator and value, i.e. `id >= 50` |
+| `Array (6, 2)` — numeric key | bind values for placeholders you wrote yourself |
+
+So `where ('id', Array ('>=' => 50))` compares, while `where ('(id = ? or id = ?)',
+Array (6, 2))` fills in the two `?` in the condition. Pass an explicit operator
+(`where ('id', Array (1, 2), 'IN')`) whenever a numerically indexed array should be
+compared rather than bound.
+
 
 Find the total number of rows matched. Simple pagination example:
 ```php
@@ -579,6 +624,22 @@ $results = $db
 ```php
 $db->where('id', 1);
 if($db->delete('users')) echo 'successfully deleted';
+```
+
+`delete()` returns `true` when the statement ran, whether or not it matched any rows;
+use `$db->count` for the number of rows actually removed. If the statement itself fails
+(an unknown column, for instance) it throws an `Exception` carrying that error, and the
+builder state is reset either way, so a failed delete cannot leak its `where()`
+conditions into the next query.
+
+```php
+$db->where('id', 1);
+try {
+    $db->delete('users');
+    echo "removed {$db->count} row(s)";
+} catch (Exception $e) {
+    echo 'delete failed: ' . $e->getMessage();
+}
 ```
 
 
@@ -794,6 +855,10 @@ else
     echo 'Update failed. Error: '. $db->getLastError();
 ```
 
+The recorded error is cleared when the next query starts, so `getLastError()` and
+`getLastErrno()` always describe the most recent query and never a stale failure from an
+earlier one.
+
 ### Query execution time benchmarking
 To track query execution time setTrace() function should be called.
 ```php
@@ -841,5 +906,32 @@ Example:
 $db->setLockMethod("READ")->lock(array("users", "log"));
 ```
 This will lock the tables **users** and **log** for **READ** access only.
-Make sure you use **unlock()* afterwards or your tables will remain locked!
+Make sure you use **unlock()** afterwards or your tables will remain locked!
+
+`setLockMethod()` accepts only `READ` or `WRITE` (case insensitively) and throws an
+`Exception` for anything else.
+
+### Running the tests
+
+The test suite is split in two.
+
+**Unit tests** need no database at all: they drive the query builder through a stub
+statement and assert on the SQL and bind parameters it produces.
+
+```bash
+composer install
+composer test-unit
+```
+
+**Integration tests** run against a real MySQL/MariaDB server. They skip themselves
+unless `DB_HOST` and `DB_NAME` are set, and they only touch tables prefixed with
+`phpunit_`, dropping them afterwards.
+
+```bash
+DB_HOST=127.0.0.1 DB_USER=root DB_PASS=secret DB_NAME=testdb composer test-integration
+```
+
+`composer test` runs both. The `tests/legacy/` directory holds the original standalone
+scripts; they still work when pointed at a database, but new coverage belongs in
+`tests/unit/` or `tests/integration/`.
 
