@@ -37,6 +37,24 @@ Class will be related to 'user' table. To change the table name, define correct 
 Both objects created throw new class file creation of with `table()` method will have the same set of methods available. Only exception is that relations, validation or custom model methods
 will not be working with an objects created with `table()` method.
 
+The name passed to `table()` becomes a PHP class name, so it must be a valid identifier:
+letters, digits and underscores, not starting with a digit. Anything else throws an
+`Exception`.
+
+### Calling MysqliDb methods on a model
+
+Any method the model does not define itself is forwarded to the underlying `MysqliDb`
+instance. Chainable builder methods (`where()`, `orderBy()`, `join()`, ...) keep
+returning the model so you can carry on chaining, while methods that produce a value
+return that value:
+
+```php
+$users = user::where('active', 1)->orderBy('id', 'ASC')->get();  // returns models
+
+$user->save();
+echo $user->getLastError();   // the MySQL error string, not the model
+```
+
 
 ### Selects
 Retrieving objects from the database is pretty much the same process as a mysqliDb `get()`/`getOne()`/`getValue()` methods without a need to specify table name. All mysqlidb functions like `where()`, `orWhere()`, `orderBy()`, `join()`, etc. are supported.
@@ -93,7 +111,7 @@ $user = new user ($data);
 $id = $user->save();
 if ($id == null) {
     print_r($user->errors);
-    echo $db->getLastError;
+    echo $db->getLastError();
 } else
     echo "user created with id = " . $id;
 ```
@@ -139,6 +157,9 @@ $user->delete();
 ### Relations
 Currently dbObject supports only `hasMany` and `hasOne` relations. To use them declare `$relations` array in the model class.
 After that you can get related object via variable names defined as keys.
+
+Requesting a relation that is not declared throws an `Exception`. Reading a relation
+whose foreign key is absent from the loaded data returns `null` rather than warning.
 
 ## hasOne example:
 ```php
@@ -249,6 +270,11 @@ First parameter is a field type. Types could be the one of following: text, bool
 Second parameter is 'required' and its defines that following entry field be always defined.
 
 **NOTE:** All variables which are not defined in the `$dbFields` array will be ignored from insert/update statement.
+
+**NOTE:** `update()` requires `$dbFields` to be declared and returns `false` immediately
+when it is not, so models created with `table()` (which have no field definitions) can be
+inserted and deleted but not updated. `insert()` has no such requirement. Declare
+`$dbFields` on any model you intend to update.
 
 ### Using array as a return value
 dbObject can return its data as array instead of object. To do that, the `ArrayBuilder()` function should be used in the beginning of the call.

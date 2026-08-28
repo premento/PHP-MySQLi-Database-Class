@@ -10,7 +10,7 @@
  * @copyright Copyright (c) 2010-2017
  * @license   http://opensource.org/licenses/gpl-3.0.html GNU Public License
  * @link      http://github.com/joshcam/PHP-MySQLi-Database-Class
- * @version   2.9.3
+ * @version   2.10.0
  */
 
 class MysqliDb
@@ -253,7 +253,25 @@ class MysqliDb
     protected $_transaction_in_progress = false;
 
     /**
-     * @param string $host
+     * Whether the shutdown handler used to roll back unfinished transactions
+     * has already been registered for this instance.
+     *
+     * @var bool
+     */
+    protected $_shutdownHandlerRegistered = false;
+
+    /**
+     * The exception from the most recent failed mysqli call, when mysqli is in its
+     * PHP 8.1+ exception reporting mode.
+     *
+     * @var mysqli_sql_exception|null
+     */
+    protected $_lastMysqliException = null;
+
+    /**
+     * @param string|array $host Hostname, a mysqli instance, or an associative array
+     *                           of connection settings (host, username, password, db,
+     *                           port, socket, charset, prefix, isSubQuery)
      * @param string $username
      * @param string $password
      * @param string $db
@@ -264,12 +282,21 @@ class MysqliDb
     public function __construct($host = null, $username = null, $password = null, $db = null, $port = null, $charset = 'utf8', $socket = null)
     {
         $isSubQuery = false;
+        $prefix = null;
 
-        // if params were passed as array
+        // if params were passed as array. Only a known set of keys is accepted so
+        // that a caller-supplied array can never clobber unrelated local variables.
         if (is_array($host)) {
-            foreach ($host as $key => $val) {
-                $$key = $val;
-            }
+            $settings = $host;
+            $host = isset($settings['host']) ? $settings['host'] : null;
+            $username = isset($settings['username']) ? $settings['username'] : $username;
+            $password = isset($settings['password']) ? $settings['password'] : $password;
+            $db = isset($settings['db']) ? $settings['db'] : $db;
+            $port = isset($settings['port']) ? $settings['port'] : $port;
+            $charset = array_key_exists('charset', $settings) ? $settings['charset'] : $charset;
+            $socket = isset($settings['socket']) ? $settings['socket'] : $socket;
+            $prefix = isset($settings['prefix']) ? $settings['prefix'] : null;
+            $isSubQuery = !empty($settings['isSubQuery']);
         }
 
         $this->addConnection('default', array(
@@ -292,6 +319,53 @@ class MysqliDb
         }
 
         self::$_instance = $this;
+    }
+
+    /**
+     * Run a mysqli call, normalising the two possible error conventions.
+     *
+     * Since PHP 8.1 the default mysqli error mode is MYSQLI_REPORT_ERROR |
+     * MYSQLI_REPORT_STRICT, which makes mysqli throw mysqli_sql_exception instead of
+     * returning false. Older code (and applications that call mysqli_report(MYSQLI_REPORT_OFF))
+     * still rely on the false return. This helper makes both behave the same way so the
+     * rest of the class only has to deal with a single convention.
+     *
+     * @param callable $callback
+     *
+     * @return mixed The callback result, or false when mysqli signalled an error.
+     */
+    protected function _muteMysqliError(callable $callback)
+    {
+        $this->_lastMysqliException = null;
+
+        try {
+            return $callback();
+        } catch (mysqli_sql_exception $e) {
+            $this->_lastMysqliException = $e;
+            return false;
+        }
+    }
+
+    /**
+     * Error message for the most recent failed mysqli call.
+     *
+     * Prefers the connection's own error string and falls back to the message of the
+     * caught mysqli_sql_exception, so the failure is always reported with something
+     * useful regardless of which error convention is active.
+     *
+     * @param string $error   Error string read from the mysqli/statement object.
+     *
+     * @return string
+     */
+    protected function _describeMysqliError($error)
+    {
+        if ($error !== null && $error !== '') {
+            return $error;
+        }
+
+        return $this->_lastMysqliException instanceof mysqli_sql_exception
+            ? $this->_lastMysqliException->getMessage()
+            : (string) $error;
     }
 
     /**
@@ -319,8 +393,15 @@ class MysqliDb
             throw new Exception('MySQL host or socket is not set');
         }
 
-        $mysqlic = new ReflectionClass('mysqli');
-        $mysqli = $mysqlic->newInstanceArgs($params);
+        // mysqli throws mysqli_sql_exception on PHP 8.1+ by default and returns an object
+        // with connect_error set when the host application disabled that reporting mode.
+        // Both are translated into this class' own Exception so callers see one behaviour.
+        try {
+            $mysqlic = new ReflectionClass('mysqli');
+            $mysqli = $mysqlic->newInstanceArgs($params);
+        } catch (mysqli_sql_exception $e) {
+            throw new Exception('Connect Error ' . $e->getCode() . ': ' . $e->getMessage(), (int) $e->getCode(), $e);
+        }
 
         if ($mysqli->connect_error) {
             throw new Exception('Connect Error ' . $mysqli->connect_errno . ': ' . $mysqli->connect_error, $mysqli->connect_errno);
@@ -527,35 +608,112 @@ class MysqliDb
      */
 	private function queryUnprepared($query)
 	{
-        // Execute query
-        $stmt = $this->mysqli()->query($query);
+        $mysqli = $this->mysqli();
+
+        // Execute query. _muteMysqliError() normalises the PHP 8.1+ exception mode
+        // back into a false return so the reconnect handling below stays reachable.
+        $stmt = $this->_muteMysqliError(static function () use ($mysqli, $query) {
+            return $mysqli->query($query);
+        });
 
         // Failed?
         if ($stmt !== false)
             return $stmt;
 
-        if ($this->mysqli()->errno === 2006 && $this->autoReconnect === true && $this->autoReconnectCount === 0) {
+        if ($mysqli->errno === 2006 && $this->autoReconnect === true && $this->autoReconnectCount === 0) {
             $this->connect($this->defConnectionName);
             $this->autoReconnectCount++;
             return $this->queryUnprepared($query);
         }
 
-        throw new Exception(sprintf('Unprepared Query Failed, ERRNO: %u (%s)', $this->mysqli()->errno, $this->mysqli()->error), $this->mysqli()->errno);
+        throw new Exception(
+            sprintf('Unprepared Query Failed, ERRNO: %u (%s)', $mysqli->errno, $this->_describeMysqliError($mysqli->error)),
+            $mysqli->errno
+        );
     }
 
     /**
-     * Prefix add raw SQL query.
+     * Tokens that may directly follow FROM/INTO/UPDATE/JOIN/DESCRIBE but are keywords
+     * rather than table names, and so must never receive a table prefix.
+     *
+     * @var string[]
+     */
+    private static $_noPrefixKeywords = array(
+        'DUAL', 'OUTFILE', 'DUMPFILE', 'LOW_PRIORITY', 'HIGH_PRIORITY', 'DELAYED',
+        'IGNORE', 'QUICK', 'LATERAL', 'ONLY', 'SELECT',
+    );
+
+    /**
+     * Add the configured table prefix to the table names of a raw SQL query.
+     *
+     * The query is scanned rather than blindly search/replaced, so string literals,
+     * quoted identifiers and comments are left untouched, and "ON DUPLICATE KEY UPDATE"
+     * is not mistaken for an UPDATE statement.
+     *
+     * Two things are deliberately left alone:
+     *  - schema qualified names ("otherdb.users"), because the schema is explicit; and
+     *  - names that already start with the prefix, so a query that was written with the
+     *    prefix in it is not prefixed twice.
      *
      * @author Emre Emir <https://github.com/bejutassle>
-     * @param string $query      User-provided query to execute.
-     * @return string Contains the returned rows from the query.
+     *
+     * @param string $query User-provided query.
+     *
+     * @return string The query with table prefixes applied.
      */
-    public function rawAddPrefix($query){
-        $query = str_replace(PHP_EOL, '', $query);
-        $query = preg_replace('/\s+/', ' ', $query);
-        $query = preg_replace("/(from|into|update|join|describe) [\\'\\´\\`]?([a-zA-Z0-9_-]+)[\\'\\´\\`]?/i", "\$1 `" . self::$prefix . "\$2`", $query);
+    public function rawAddPrefix($query)
+    {
+        if (self::$prefix === '' || self::$prefix === null) {
+            return $query;
+        }
 
-        return $query;
+        $pattern = '/
+              (?P<skip>
+                    --[^\r\n]*                          # -- line comment
+                  | \#[^\r\n]*                          # # line comment
+                  | \/\*.*?\*\/                         # block comment
+                  | \'(?:[^\'\\\\]|\\\\.|\'\')*\'       # single quoted string
+                  | "(?:[^"\\\\]|\\\\.|"")*"            # double quoted string
+                  | `(?:[^`]|``)*`                      # quoted identifier
+                  | \bON\s+DUPLICATE\s+KEY\s+UPDATE\b   # not an UPDATE statement
+              )
+            |
+              (?P<kw>\b(?:FROM|INTO|UPDATE|JOIN|DESCRIBE)\b\s+)
+              (?P<open>`?)
+              (?P<tbl>[A-Za-z0-9_$-]+)
+              (?P=open)
+              (?P<qual>\s*\.\s*`?[A-Za-z0-9_$-]+`?)?
+        /isx';
+
+        $result = preg_replace_callback($pattern, static function ($m) {
+            // Anything matched by the skip branch is passed through verbatim.
+            if (isset($m['skip']) && $m['skip'] !== '') {
+                return $m[0];
+            }
+
+            $table = $m['tbl'];
+
+            // Schema qualified name: the caller was explicit, leave it as written.
+            if (isset($m['qual']) && $m['qual'] !== '') {
+                return $m[0];
+            }
+
+            if (in_array(strtoupper($table), self::$_noPrefixKeywords, true)) {
+                return $m[0];
+            }
+
+            // Already prefixed, do not prefix twice.
+            if (strncmp($table, self::$prefix, strlen(self::$prefix)) === 0) {
+                return $m[0];
+            }
+
+            return $m['kw'] . '`' . self::$prefix . $table . '`';
+        }, $query);
+
+        // preg_replace_callback() returns null if the subject could not be processed
+        // (for example a backtrack limit hit on a very large query). Never silently
+        // hand back a broken or empty query in that case.
+        return $result === null ? $query : $result;
     }
 
     /**
@@ -569,6 +727,7 @@ class MysqliDb
      */
     public function rawQuery($query, $bindParams = null)
     {
+        $this->_clearStatementError();
         $query = $this->rawAddPrefix($query);
         $params = array(''); // Create the empty 0 index
         $this->_query = $query;
@@ -583,10 +742,8 @@ class MysqliDb
             call_user_func_array(array($stmt, 'bind_param'), $this->refValues($params));
         }
 
-        $stmt->execute();
+        $this->_executeStatement($stmt);
         $this->count = $stmt->affected_rows;
-        $this->_stmtError = $stmt->error;
-        $this->_stmtErrno = $stmt->errno;
         $this->_lastQuery = $this->replacePlaceHolders($this->_query, $params);
         $res = $this->_dynamicBindResults($stmt);
         $this->reset();
@@ -659,9 +816,7 @@ class MysqliDb
     {
         $this->_query = $query;
         $stmt = $this->_buildQuery($numRows);
-        $stmt->execute();
-        $this->_stmtError = $stmt->error;
-        $this->_stmtErrno = $stmt->errno;
+        $this->_executeStatement($stmt);
         $res = $this->_dynamicBindResults($stmt);
         $this->reset();
 
@@ -753,9 +908,7 @@ class MysqliDb
             return $this;
         }
 
-        $stmt->execute();
-        $this->_stmtError = $stmt->error;
-        $this->_stmtErrno = $stmt->errno;
+        $this->_executeStatement($stmt);
         $res = $this->_dynamicBindResults($stmt);
         $this->reset();
 
@@ -852,20 +1005,37 @@ class MysqliDb
             $this->startTransaction();
         }
 
-        foreach ($multiInsertData as $insertData) {
-            if($dataKeys !== null) {
-                // apply column-names if given, else assume they're already given in the data
-                $insertData = array_combine($dataKeys, $insertData);
-            }
-
-            $id = $this->insert($tableName, $insertData);
-            if(!$id) {
-                if($autoCommit) {
-                    $this->rollback();
+        try {
+            foreach ($multiInsertData as $rowIndex => $insertData) {
+                if($dataKeys !== null) {
+                    // apply column-names if given, else assume they're already given in the data
+                    if (!is_array($insertData) || count($dataKeys) !== count($insertData)) {
+                        // array_combine() raises a ValueError on a length mismatch. Report
+                        // which row is at fault instead, and still roll back below.
+                        throw new Exception(sprintf(
+                            'insertMulti: row %s has %d value(s) but %d column name(s) were given',
+                            (string) $rowIndex,
+                            is_array($insertData) ? count($insertData) : 0,
+                            count($dataKeys)
+                        ));
+                    }
+                    $insertData = array_combine($dataKeys, $insertData);
                 }
-                return false;
+
+                $id = $this->insert($tableName, $insertData);
+                if(!$id) {
+                    if($autoCommit) {
+                        $this->rollback();
+                    }
+                    return false;
+                }
+                $ids[] = $id;
             }
-            $ids[] = $id;
+        } catch (Exception $e) {
+            if($autoCommit) {
+                $this->rollback();
+            }
+            throw $e;
         }
 
         if($autoCommit) {
@@ -923,11 +1093,10 @@ class MysqliDb
         $this->_query = "UPDATE " . self::$prefix . $tableName;
 
         $stmt = $this->_buildQuery($numRows, $tableData);
-        $status = $stmt->execute();
-        $this->reset();
-        $this->_stmtError = $stmt->error;
-        $this->_stmtErrno = $stmt->errno;
+        $status = $this->_executeStatement($stmt);
         $this->count = $stmt->affected_rows;
+        $this->_closeStatement($stmt);
+        $this->reset();
 
         return $status;
     }
@@ -949,7 +1118,6 @@ class MysqliDb
         if ($this->isSubQuery) {
             throw new Exception('Delete function cannot be used within a subquery context.');
         }
-        
 
         $table = self::$prefix . $tableName;
 
@@ -961,16 +1129,22 @@ class MysqliDb
 
         $stmt = $this->_buildQuery($numRows);
 
-        // Error handling
-        if (!$stmt->execute()) {
-            throw new Exception('Failed to execute delete operation: ' . $this->_stmtError);
-        }
-        $this->_stmtError = $stmt->error;
-        $this->_stmtErrno = $stmt->errno;
+        // _executeStatement() records the error before it is read, and the builder state
+        // is reset on the failure path too so it cannot leak into the next query.
+        $status = $this->_executeStatement($stmt);
         $this->count = $stmt->affected_rows;
+        $error = $this->_stmtError;
+        $errno = $this->_stmtErrno;
+        $this->_closeStatement($stmt);
         $this->reset();
 
-        return ($stmt->affected_rows >= 0); // anything greater than -1 indicates success
+        if (!$status) {
+            $this->_stmtError = $error;
+            $this->_stmtErrno = $errno;
+            throw new Exception('Failed to execute delete operation: ' . $error, (int) $errno);
+        }
+
+        return true;
     }
 
     /**
@@ -987,6 +1161,14 @@ class MysqliDb
      */
     public function where($whereProp, $whereValue = 'DBNULL', $operator = '=', $cond = 'AND')
     {
+        // Support the documented operator-as-key form, e.g. where('id', Array('>=' => 50)).
+        // A numerically indexed array is *not* this form: it carries bind values for a raw
+        // condition such as where('(id = ? or id = ?)', Array(6, 2)).
+        if (is_array($whereValue) && ($key = key($whereValue)) !== null && !is_int($key)) {
+            $operator = $key;
+            $whereValue = $whereValue[$key];
+        }
+
         if (count($this->_where) == 0) {
             $cond = '';
         }
@@ -1043,8 +1225,9 @@ class MysqliDb
 
     public function having($havingProp, $havingValue = 'DBNULL', $operator = '=', $cond = 'AND')
     {
-        // forkaround for an old operation api
-        if (is_array($havingValue) && ($key = key($havingValue)) != "0") {
+        // Support the operator-as-key form, e.g. having('total', Array('>' => 10)).
+        // A numerically indexed array carries bind values instead and is left alone.
+        if (is_array($havingValue) && ($key = key($havingValue)) !== null && !is_int($key)) {
             $operator = $key;
             $havingValue = $havingValue[$key];
         }
@@ -1068,7 +1251,7 @@ class MysqliDb
      *
      * @return MysqliDb
      */
-    public function orHaving($havingProp, $havingValue = null, $operator = null)
+    public function orHaving($havingProp, $havingValue = 'DBNULL', $operator = '=')
     {
         return $this->having($havingProp, $havingValue, $operator, 'OR');
     }
@@ -1136,7 +1319,7 @@ class MysqliDb
 		}
 
 		// Add the prefix to the import table
-		$table = self::$prefix . $importTable;
+		$table = self::$prefix . $this->_escapeIdentifier($importTable);
 
 		// Add 1 more slash to every slash so maria will interpret it as a path
 		$importFile = str_replace("\\", "\\\\", $importFile);
@@ -1144,24 +1327,26 @@ class MysqliDb
 		// Switch between LOAD DATA and LOAD DATA LOCAL
 		$loadDataLocal = isset($settings["loadDataLocal"]) ? 'LOCAL' : '';
 
-		// Build SQL Syntax
+		// The statement below has to run unprepared, so every interpolated value is
+		// escaped explicitly. Without this a caller-supplied filename or delimiter can
+		// terminate the string literal and inject arbitrary SQL.
 		$sqlSyntax = sprintf('LOAD DATA %s INFILE \'%s\' INTO TABLE %s',
-			$loadDataLocal, $importFile, $table);
+			$loadDataLocal, $this->escape($importFile), $table);
 
 		// FIELDS
-		$sqlSyntax .= sprintf(' FIELDS TERMINATED BY \'%s\'', $settings["fieldChar"]);
+		$sqlSyntax .= sprintf(' FIELDS TERMINATED BY \'%s\'', $this->escape($settings["fieldChar"]));
 		if (isset($settings["fieldEnclosure"])) {
-			$sqlSyntax .= sprintf(' ENCLOSED BY \'%s\'', $settings["fieldEnclosure"]);
+			$sqlSyntax .= sprintf(' ENCLOSED BY \'%s\'', $this->escape($settings["fieldEnclosure"]));
 		}
 
 		// LINES
-		$sqlSyntax .= sprintf(' LINES TERMINATED BY \'%s\'', $settings["lineChar"]);
+		$sqlSyntax .= sprintf(' LINES TERMINATED BY \'%s\'', $this->escape($settings["lineChar"]));
 		if (isset($settings["lineStarting"])) {
-			$sqlSyntax .= sprintf(' STARTING BY \'%s\'', $settings["lineStarting"]);
+			$sqlSyntax .= sprintf(' STARTING BY \'%s\'', $this->escape($settings["lineStarting"]));
 		}
 
 		// IGNORE LINES
-		$sqlSyntax .= sprintf(' IGNORE %d LINES', $settings["linesToIgnore"]);
+		$sqlSyntax .= sprintf(' IGNORE %d LINES', (int) $settings["linesToIgnore"]);
 
 		// Execute the query unprepared because LOAD DATA only works with unprepared statements.
 		$result = $this->queryUnprepared($sqlSyntax);
@@ -1190,7 +1375,6 @@ class MysqliDb
 		if(!file_exists($importFile)) {
 			// Does not exists
 			throw new Exception("loadXml: Import file does not exists");
-			return;
 		}
 
 		// Create default values
@@ -1202,22 +1386,22 @@ class MysqliDb
 		}
 
 		// Add the prefix to the import table
-		$table = self::$prefix . $importTable;
+		$table = self::$prefix . $this->_escapeIdentifier($importTable);
 
 		// Add 1 more slash to every slash so maria will interpret it as a path
 		$importFile = str_replace("\\", "\\\\", $importFile);
 
-		// Build SQL Syntax
+		// Runs unprepared, so interpolated values are escaped explicitly. See loadData().
 		$sqlSyntax = sprintf('LOAD XML INFILE \'%s\' INTO TABLE %s',
-								 $importFile, $table);
+								 $this->escape($importFile), $table);
 
 		// FIELDS
 		if(isset($settings["rowTag"])) {
-			$sqlSyntax .= sprintf(' ROWS IDENTIFIED BY \'%s\'', $settings["rowTag"]);
+			$sqlSyntax .= sprintf(' ROWS IDENTIFIED BY \'%s\'', $this->escape($settings["rowTag"]));
 		}
 
 		// IGNORE LINES
-		$sqlSyntax .= sprintf(' IGNORE %d LINES', $settings["linesToIgnore"]);
+		$sqlSyntax .= sprintf(' IGNORE %d LINES', (int) $settings["linesToIgnore"]);
 
 		// Exceute the query unprepared because LOAD XML only works with unprepared statements.
 		$result = $this->queryUnprepared($sqlSyntax);
@@ -1260,11 +1444,14 @@ class MysqliDb
                 $customFieldsOrRegExp[$key] = preg_replace("/[^\x80-\xff-a-z0-9\.\(\),_` ]+/i", '', $value);
             }
             $orderByField = 'FIELD (' . $orderByField . ', "' . implode('","', $customFieldsOrRegExp) . '")';
-        }elseif(is_string($customFieldsOrRegExp)){
-	    $orderByField = $orderByField . " REGEXP '" . $customFieldsOrRegExp . "'";
-	}elseif($customFieldsOrRegExp !== null){
-	    throw new Exception('Wrong custom field or Regular Expression: ' . $customFieldsOrRegExp);
-	}
+        } elseif (is_string($customFieldsOrRegExp)) {
+            // The expression is inlined into the query, so it has to be escaped. It used
+            // to be concatenated verbatim, which let a caller-supplied pattern break out
+            // of the string literal.
+            $orderByField = $orderByField . " REGEXP '" . $this->escape($customFieldsOrRegExp) . "'";
+        } elseif ($customFieldsOrRegExp !== null) {
+            throw new Exception('Wrong custom field or Regular Expression: ' . (is_scalar($customFieldsOrRegExp) ? $customFieldsOrRegExp : gettype($customFieldsOrRegExp)));
+        }
 
         $this->_orderBy[$orderByField] = $orderbyDirection;
         return $this;
@@ -1300,18 +1487,16 @@ class MysqliDb
      */
 	public function setLockMethod($method)
 	{
-		// Switch the uppercase string
-		switch(strtoupper($method)) {
-			// Is it READ or WRITE?
-			case "READ" || "WRITE":
-				// Succeed
-				$this->_tableLockMethod = $method;
-				break;
-			default:
-				// Else throw an exception
-				throw new Exception("Bad lock type: Can be either READ or WRITE");
-				break;
+		$method = strtoupper(trim((string) $method));
+
+		// NB: this used to read `case "READ" || "WRITE":`, which evaluates to `case true:`
+		// and therefore accepted every non-empty string.
+		if ($method !== 'READ' && $method !== 'WRITE') {
+			throw new Exception("Bad lock type: Can be either READ or WRITE");
 		}
+
+		$this->_tableLockMethod = $method;
+
 		return $this;
 	}
 
@@ -1327,49 +1512,38 @@ class MysqliDb
      */
 	public function lock($table)
 	{
-		// Main Query
-		$this->_query = "LOCK TABLES";
+		$tables = is_array($table) ? $table : array($table);
 
-		// Is the table an array?
-		if(gettype($table) == "array") {
-			// Loop trough it and attach it to the query
-			foreach($table as $key => $value) {
-				if(gettype($value) == "string") {
-					if($key > 0) {
-						$this->_query .= ",";
-					}
-					$this->_query .= " ".self::$prefix.$value." ".$this->_tableLockMethod;
-				}
+		$locks = array();
+		foreach ($tables as $value) {
+			if (!is_string($value)) {
+				continue;
 			}
+			// NB: comma placement used to be driven by the array *key*, which produced
+			// invalid SQL for any array that was not sequentially indexed from zero.
+			$locks[] = self::$prefix . $value . " " . $this->_tableLockMethod;
 		}
-		else{
-			// Build the table prefix
-			$table = self::$prefix . $table;
 
-			// Build the query
-			$this->_query = "LOCK TABLES ".$table." ".$this->_tableLockMethod;
+		if (empty($locks)) {
+			throw new Exception("Lock failed: no table name given");
 		}
+
+		$this->_query = "LOCK TABLES " . implode(", ", $locks);
+		$description = implode(", ", $locks);
 
 		// Execute the query unprepared because LOCK only works with unprepared statements.
 		$result = $this->queryUnprepared($this->_query);
-        $errno  = $this->mysqli()->errno;
+		$errno  = $this->mysqli()->errno;
 
 		// Reset the query
 		$this->reset();
 
-		// Are there rows modified?
-		if($result) {
-			// Return true
-			// We can't return ourself because if one table gets locked, all other ones get unlocked!
-			return true;
-		}
-		// Something went wrong
-		else {
-			throw new Exception("Locking of table ".$table." failed", $errno);
+		if (!$result) {
+			throw new Exception("Locking of table " . $description . " failed", $errno);
 		}
 
-		// Return the success value
-		return false;
+		// We can't return ourself because if one table gets locked, all other ones get unlocked!
+		return true;
 	}
 
     /**
@@ -1392,18 +1566,10 @@ class MysqliDb
 		// Reset the query
 		$this->reset();
 
-		// Are there rows modified?
-		if($result) {
-			// return self
-			return $this;
-		}
-		// Something went wrong
-		else {
+		if (!$result) {
 			throw new Exception("Unlocking of tables failed", $errno);
 		}
 
-
-		// Return self
 		return $this;
 	}
 
@@ -1429,7 +1595,32 @@ class MysqliDb
      */
     public function escape($str)
     {
-        return $str ? $this->mysqli()->real_escape_string($str) : $str;
+        if ($str === null) {
+            return null;
+        }
+
+        // Cast explicitly: passing a non-string to real_escape_string() is deprecated
+        // since PHP 8.1. The previous truthiness check also skipped "0" and 0.
+        return $this->mysqli()->real_escape_string((string) $str);
+    }
+
+    /**
+     * Quote a table or column name so it can safely be inlined into a query.
+     *
+     * @param string $identifier
+     *
+     * @return string
+     * @throws Exception
+     */
+    protected function _escapeIdentifier($identifier)
+    {
+        $identifier = (string) $identifier;
+
+        if ($identifier === '' || preg_match('/[`\x00]/', $identifier)) {
+            throw new Exception('Invalid identifier: ' . $identifier);
+        }
+
+        return $identifier;
     }
 
     /**
@@ -1462,22 +1653,19 @@ class MysqliDb
             case 'NULL':
             case 'string':
                 return 's';
-                break;
 
             case 'boolean':
             case 'integer':
                 return 'i';
-                break;
-
-            case 'blob':
-                return 'b';
-                break;
 
             case 'double':
                 return 'd';
-                break;
         }
-        return '';
+
+        // Returning '' here used to desynchronise the type string from the number of
+        // bound values, which surfaces much later as an opaque bind_param() error.
+        // gettype() never returns 'blob', so there was never a 'b' case to hit.
+        throw new Exception('Unsupported bind parameter type: ' . gettype($item));
     }
 
     /**
@@ -1520,10 +1708,35 @@ class MysqliDb
             return ' ' . $operator . ' ? ';
         }
 
+        if (!$value instanceof MysqliDb) {
+            throw new Exception('Only MysqliDb subquery objects can be used as a value, got ' . get_class($value));
+        }
+
         $subQuery = $value->getSubQuery();
         $this->_bindParams($subQuery['params']);
 
         return " " . $operator . " (" . $subQuery['query'] . ") " . $subQuery['alias'];
+    }
+
+    /**
+     * Inline a subquery without its alias, for contexts such as IN (...) and EXISTS (...)
+     * where a trailing alias would be a syntax error.
+     *
+     * @param MysqliDb $value
+     *
+     * @return string The parenthesised subquery.
+     * @throws Exception
+     */
+    protected function _buildSubQueryExpression($value)
+    {
+        if (!$value instanceof MysqliDb) {
+            throw new Exception('Only MysqliDb subquery objects can be used as a subquery value');
+        }
+
+        $subQuery = $value->getSubQuery();
+        $this->_bindParams($subQuery['params']);
+
+        return '(' . trim($subQuery['query']) . ')';
     }
 
     /**
@@ -1544,14 +1757,16 @@ class MysqliDb
 
         $this->_query = $operation . " " . implode(' ', $this->_queryOptions) . " INTO " . self::$prefix . $tableName;
         $stmt = $this->_buildQuery(null, $insertData);
-        $status = $stmt->execute();
-        $this->_stmtError = $stmt->error;
-        $this->_stmtErrno = $stmt->errno;
+        $status = $this->_executeStatement($stmt);
         $haveOnDuplicate = !empty ($this->_updateColumns);
-        $this->reset();
-        $this->count = $stmt->affected_rows;
 
-        if ($stmt->affected_rows < 1) {
+        $affectedRows = $stmt->affected_rows;
+        $insertId = $stmt->insert_id;
+        $this->_closeStatement($stmt);
+        $this->reset();
+        $this->count = $affectedRows;
+
+        if ($affectedRows < 1) {
             // in case of onDuplicate() usage, if no rows were inserted
             if ($status && $haveOnDuplicate) {
                 return true;
@@ -1559,8 +1774,8 @@ class MysqliDb
             return false;
         }
 
-        if ($stmt->insert_id > 0) {
-            return $stmt->insert_id;
+        if ($insertId > 0) {
+            return $insertId;
         }
 
         return true;
@@ -1580,7 +1795,7 @@ class MysqliDb
      */
     protected function _buildQuery($numRows = null, $tableData = null)
     {
-        // $this->_buildJoinOld();
+        $this->_clearStatementError();
         $this->_buildJoin();
         $this->_buildInsertQuery($tableData);
         $this->_buildCondition('WHERE', $this->_where);
@@ -1619,11 +1834,15 @@ class MysqliDb
      * , when the number of variables to pass is unknown.
      *
      * @param mysqli_stmt $stmt Equal to the prepared statement object.
+     *                          The parameter is intentionally not type hinted so the
+     *                          query builder can be exercised with a stub statement in
+     *                          unit tests; mysqli_stmt cannot be instantiated without a
+     *                          live connection.
      *
      * @return array|string The results of the SQL fetch.
      * @throws Exception
      */
-    protected function _dynamicBindResults(mysqli_stmt $stmt)
+    protected function _dynamicBindResults($stmt)
     {
         $parameters = array();
         $results = array();
@@ -1635,10 +1854,14 @@ class MysqliDb
 
         $meta = $stmt->result_metadata();
 
-        // if $meta is false yet sqlstate is true, there's no sql error but the query is
-        // most likely an update/insert/delete which doesn't produce any results
-        if (!$meta && $stmt->sqlstate)
+        // No result metadata means the query produced no result set: most likely an
+        // update/insert/delete. Close the statement before returning, otherwise every
+        // write leaks one and long running scripts hit max_prepared_stmt_count.
+        // (The original also dereferenced $meta below when sqlstate was falsy.)
+        if (!$meta) {
+            $this->_closeStatement($stmt);
             return array();
+        }
 
         $row = array();
         while ($field = $meta->fetch_field()) {
@@ -1718,9 +1941,12 @@ class MysqliDb
         }
 
         if (in_array('SQL_CALC_FOUND_ROWS', $this->_queryOptions)) {
-            $stmt = $this->mysqli()->query('SELECT FOUND_ROWS()');
-            $totalCount = $stmt->fetch_row();
-            $this->totalCount = $totalCount[0];
+            $result = $this->mysqli()->query('SELECT FOUND_ROWS()');
+            if ($result !== false) {
+                $totalCount = $result->fetch_row();
+                $this->totalCount = isset($totalCount[0]) ? (int) $totalCount[0] : 0;
+                $result->free();
+            }
         }
 
         if ($this->returnType == 'json') {
@@ -1728,32 +1954,6 @@ class MysqliDb
         }
 
         return $results;
-    }
-
-    /**
-     * Abstraction method that will build an JOIN part of the query
-     *
-     * @return void
-     */
-    protected function _buildJoinOld()
-    {
-        if (empty($this->_join)) {
-            return;
-        }
-
-        foreach ($this->_join as $data) {
-            list ($joinType, $joinTable, $joinCondition) = $data;
-
-            if (is_object($joinTable)) {
-                $joinStr = $this->_buildPair("", $joinTable);
-            } else {
-                $joinStr = $joinTable;
-            }
-
-            $this->_query .= " " . $joinType . " JOIN " . $joinStr .
-                (false !== stripos($joinCondition, 'using') ? " " : " on ")
-                . $joinCondition;
-        }
     }
 
     /**
@@ -1768,6 +1968,10 @@ class MysqliDb
     public function _buildDataPairs($tableData, $tableColumns, $isInsert)
     {
         foreach ($tableColumns as $column) {
+            if (!array_key_exists($column, $tableData)) {
+                throw new Exception("No value given for column '" . $column . "'");
+            }
+
             $value = $tableData[$column];
 
             if (!$isInsert) {
@@ -1859,7 +2063,9 @@ class MysqliDb
             return;
         }
 
-        $isInsert = preg_match('/^[INSERT|REPLACE]/', $this->_query);
+        // NB: this used to be '/^[INSERT|REPLACE]/', a character class rather than an
+        // alternation, so it matched any query starting with one of those letters.
+        $isInsert = (bool) preg_match('/^\s*(INSERT|REPLACE)\b/i', $this->_query);
         $dataColumns = array_keys($tableData);
         if ($isInsert) {
             if (isset ($dataColumns[0]))
@@ -1894,39 +2100,7 @@ class MysqliDb
         foreach ($conditions as $cond) {
             list ($concat, $varName, $operator, $val) = $cond;
             $this->_query .= " " . $concat . " " . $varName;
-
-            switch (strtolower($operator)) {
-                case 'not in':
-                case 'in':
-                    $comparison = ' ' . $operator . ' (';
-                    if (is_object($val)) {
-                        $comparison .= $this->_buildPair("", $val);
-                    } else {
-                        foreach ($val as $v) {
-                            $comparison .= ' ?,';
-                            $this->_bindParam($v);
-                        }
-                    }
-                    $this->_query .= rtrim($comparison, ',') . ' ) ';
-                    break;
-                case 'not between':
-                case 'between':
-                    $this->_query .= " $operator ? AND ? ";
-                    $this->_bindParams($val);
-                    break;
-                case 'not exists':
-                case 'exists':
-                    $this->_query.= $operator . $this->_buildPair("", $val);
-                    break;
-                default:
-                    if (is_array($val)) {
-                        $this->_bindParams($val);
-                    } elseif ($val === null) {
-                        $this->_query .= ' ' . $operator . " NULL";
-                    } elseif ($val != 'DBNULL' || $val == '0') {
-                        $this->_query .= $this->_buildPair($operator, $val);
-                    }
-            }
+            $this->conditionToSql($operator, $val);
         }
     }
 
@@ -2003,7 +2177,14 @@ class MysqliDb
      */
     protected function _prepareQuery()
     {
-        $stmt = $this->mysqli()->prepare($this->_query);
+        $mysqli = $this->mysqli();
+        $query = $this->_query;
+
+        // Normalise the PHP 8.1+ exception mode into a false return so the reconnect
+        // handling below stays reachable and the failure is reported with the query text.
+        $stmt = $this->_muteMysqliError(static function () use ($mysqli, $query) {
+            return $mysqli->prepare($query);
+        });
 
         if ($stmt !== false) {
             if ($this->traceEnabled)
@@ -2011,17 +2192,70 @@ class MysqliDb
             return $stmt;
         }
 
-        if ($this->mysqli()->errno === 2006 && $this->autoReconnect === true && $this->autoReconnectCount === 0) {
+        if ($mysqli->errno === 2006 && $this->autoReconnect === true && $this->autoReconnectCount === 0) {
             $this->connect($this->defConnectionName);
             $this->autoReconnectCount++;
             return $this->_prepareQuery();
         }
 
-        $error = $this->mysqli()->error;
-        $query = $this->_query;
-        $errno = $this->mysqli()->errno;
+        $error = $this->_describeMysqliError($mysqli->error);
+        $errno = $mysqli->errno;
         $this->reset();
         throw new Exception(sprintf('%s query: %s', $error, $query), $errno);
+    }
+
+    /**
+     * Execute a prepared statement, recording its error state.
+     *
+     * Works both when mysqli reports errors by returning false and when it throws
+     * mysqli_sql_exception (the default since PHP 8.1).
+     *
+     * @param mysqli_stmt $stmt
+     *
+     * @return bool True when the statement executed successfully.
+     */
+    protected function _executeStatement($stmt)
+    {
+        $status = $this->_muteMysqliError(static function () use ($stmt) {
+            return $stmt->execute();
+        });
+
+        $this->_stmtError = $status ? $stmt->error : $this->_describeMysqliError($stmt->error);
+        $this->_stmtErrno = $stmt->errno;
+
+        return (bool) $status;
+    }
+
+    /**
+     * Forget the error recorded for the previously executed statement.
+     *
+     * Called when a new query starts so getLastError()/getLastErrno() can never report
+     * a stale failure from an earlier query.
+     *
+     * @return void
+     */
+    protected function _clearStatementError()
+    {
+        $this->_stmtError = null;
+        $this->_stmtErrno = 0;
+    }
+
+    /**
+     * Close a statement, ignoring any error raised while doing so.
+     *
+     * @param mysqli_stmt $stmt
+     *
+     * @return void
+     */
+    protected function _closeStatement($stmt)
+    {
+        if (!is_object($stmt)) {
+            return;
+        }
+
+        $this->_muteMysqliError(static function () use ($stmt) {
+            return $stmt->close();
+        });
     }
 
     /**
@@ -2033,17 +2267,15 @@ class MysqliDb
      */
     protected function refValues(array &$arr)
     {
-        //Reference in the function arguments are required for HHVM to work
-        //https://github.com/facebook/hhvm/issues/5155
-        //Referenced data array is required by mysqli since PHP 5.3+
-        if (strnatcmp(phpversion(), '5.3') >= 0) {
-            $refs = array();
-            foreach ($arr as $key => $value) {
-                $refs[$key] = & $arr[$key];
-            }
-            return $refs;
+        // Reference in the function arguments are required for HHVM to work
+        // https://github.com/facebook/hhvm/issues/5155
+        // The old PHP 5.3 version guard here was dead code on any supported runtime.
+        $refs = array();
+        foreach ($arr as $key => $value) {
+            $refs[$key] = & $arr[$key];
         }
-        return $arr;
+
+        return $refs;
     }
 
     /**
@@ -2063,7 +2295,14 @@ class MysqliDb
             return $str;
         }
 
-        while ($pos = strpos($str, "?")) {
+        // NB: this loop used to be `while ($pos = strpos(...))`, which stopped early when
+        // a placeholder sat at offset 0, and it read past the end of $vals when the query
+        // contained more question marks than bound values.
+        while (($pos = strpos($str, "?")) !== false) {
+            if (!array_key_exists($i, $vals)) {
+                break;
+            }
+
             $val = $vals[$i++];
             if (is_object($val)) {
                 $val = '[object]';
@@ -2268,8 +2507,20 @@ class MysqliDb
      */
     public function copy()
     {
-        $copy = unserialize(serialize($this));
+        // mysqli handles are not serialisable, so they are dropped before the deep copy
+        // rather than after it. Doing it the other way round threw
+        // "Serialization of 'mysqli' is not allowed" for any connected instance.
+        $connections = $this->_mysqli;
+        $this->_mysqli = array();
+
+        try {
+            $copy = unserialize(serialize($this));
+        } finally {
+            $this->_mysqli = $connections;
+        }
+
         $copy->_mysqli = array();
+
         return $copy;
     }
 
@@ -2284,7 +2535,14 @@ class MysqliDb
     {
         $this->mysqli()->autocommit(false);
         $this->_transaction_in_progress = true;
-        register_shutdown_function(array($this, "_transaction_status_check"));
+
+        // Register once per instance. This used to add a new shutdown handler on every
+        // startTransaction() call, so a script running N transactions ended up with N
+        // handlers that could never be removed.
+        if (!$this->_shutdownHandlerRegistered) {
+            $this->_shutdownHandlerRegistered = true;
+            register_shutdown_function(array($this, "_transaction_status_check"));
+        }
     }
 
     /**
@@ -2356,12 +2614,23 @@ class MysqliDb
     {
         $dd = debug_backtrace();
         $caller = next($dd);
-        while (isset($caller) && $caller["file"] == __FILE__) {
+
+        // next() returns false once the array is exhausted, and closure/call_user_func
+        // frames have no "file" key at all -- both used to raise warnings here.
+        while (is_array($caller) && isset($caller["file"]) && $caller["file"] == __FILE__) {
             $caller = next($dd);
         }
 
-        return __CLASS__ . "->" . $caller["function"] . "() >>  file \"" .
-        str_replace($this->traceStripPrefix , '', $caller["file"]) . "\" line #" . $caller["line"] . " ";
+        if (!is_array($caller)) {
+            return __CLASS__ . "-> caller unknown ";
+        }
+
+        $function = isset($caller["function"]) ? $caller["function"] : 'unknown';
+        $file = isset($caller["file"]) ? $caller["file"] : 'unknown';
+        $line = isset($caller["line"]) ? $caller["line"] : 0;
+
+        return __CLASS__ . "->" . $function . "() >>  file \"" .
+        str_replace($this->traceStripPrefix, '', $file) . "\" line #" . $line . " ";
     }
 
     /**
@@ -2417,9 +2686,15 @@ class MysqliDb
      * @throws Exception
      */
     public function paginate ($table, $page, $fields = null) {
-        $offset = $this->pageLimit * ($page - 1);
-        $res = $this->withTotalCount()->get ($table, Array ($offset, $this->pageLimit), $fields);
-        $this->totalPages = ceil($this->totalCount / $this->pageLimit);
+        $pageLimit = (int) $this->pageLimit;
+        if ($pageLimit < 1) {
+            throw new Exception('pageLimit must be a positive integer, got ' . $this->pageLimit);
+        }
+
+        $page = max(1, (int) $page);
+        $offset = $pageLimit * ($page - 1);
+        $res = $this->withTotalCount()->get ($table, Array ($offset, $pageLimit), $fields);
+        $this->totalPages = (int) ceil($this->totalCount / $pageLimit);
         return $res;
     }
 
@@ -2497,17 +2772,22 @@ class MysqliDb
      * @param  String|array $val      The where constraint value
      */
     private function conditionToSql($operator, $val) {
-        switch (strtolower ($operator)) {
+        switch (strtolower ((string) $operator)) {
             case 'not in':
             case 'in':
-                $comparison = ' ' . $operator. ' (';
                 if (is_object ($val)) {
-                    $comparison .= $this->_buildPair ("", $val);
-                } else {
-                    foreach ($val as $v) {
-                        $comparison .= ' ?,';
-                        $this->_bindParam ($v);
-                    }
+                    // A subquery goes in directly: wrapping it in a second pair of
+                    // parentheses turns it into a scalar subquery, and MySQL then fails
+                    // with "Subquery returns more than 1 row" as soon as it matches more
+                    // than one row.
+                    $this->_query .= ' ' . $operator . ' ' . $this->_buildSubQueryExpression ($val) . ' ';
+                    break;
+                }
+
+                $comparison = ' ' . $operator. ' (';
+                foreach ((array) $val as $v) {
+                    $comparison .= ' ?,';
+                    $this->_bindParam ($v);
                 }
                 $this->_query .= rtrim($comparison, ',').' ) ';
                 break;
@@ -2518,14 +2798,20 @@ class MysqliDb
                 break;
             case 'not exists':
             case 'exists':
-                $this->_query.= $operator . $this->_buildPair ("", $val);
+                // Same reasoning as IN: an alias after the closing parenthesis is a
+                // syntax error here.
+                $this->_query .= ' ' . $operator . ' ' . $this->_buildSubQueryExpression ($val) . ' ';
                 break;
             default:
                 if (is_array ($val))
+                    // Bind values for a raw condition that already carries its own
+                    // placeholders, e.g. where('(id = ? or id = ?)', Array(6, 2)).
                     $this->_bindParams ($val);
                 else if ($val === null)
-                    $this->_query .= $operator . " NULL";
-                else if ($val != 'DBNULL' || $val == '0')
+                    // NB: the leading space was missing here, which produced
+                    // "columnIS NOT NULL" for join conditions.
+                    $this->_query .= ' ' . $operator . " NULL";
+                else if ($val !== 'DBNULL')
                     $this->_query .= $this->_buildPair ($operator, $val);
         }
     }

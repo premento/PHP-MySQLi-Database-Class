@@ -17,12 +17,30 @@
         }
     ],
     "require": {
-        "php": ">=8.3.0"
+        "php": ">=8.3.0",
+        "ext-mysqli": "*"
+    },
+    "require-dev": {
+        "phpunit/phpunit": "^11.0"
     },
     "autoload": {
-        "files": [
+        "classmap": [
             "MysqliDb.php",
             "dbObject.php"
         ]
+    },
+    "autoload-dev": {
+        "classmap": [
+            "tests/unit/Support/",
+            "tests/integration/IntegrationTestCase.php"
+        ]
+    },
+    "scripts": {
+        "test": "phpunit",
+        "test-unit": "phpunit --testsuite unit",
+        "test-integration": "phpunit --testsuite integration"
+    },
+    "config": {
+        "sort-packages": true
     }
 }

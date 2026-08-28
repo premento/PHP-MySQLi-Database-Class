@@ -1,6 +1,6 @@
 <?php
-require_once ("../MysqliDb.php");
-require_once ("../dbObject.php");
+require_once (__DIR__ . "/../../MysqliDb.php");
+require_once (__DIR__ . "/../../dbObject.php");
 
 echo "Testing dbObject compatibility with PR changes...\n";
 

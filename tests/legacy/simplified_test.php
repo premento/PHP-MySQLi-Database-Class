@@ -1,5 +1,5 @@
 <?php
-require_once ("../MysqliDb.php");
+require_once (__DIR__ . "/../../MysqliDb.php");
 error_reporting(E_ALL);
 
 echo "Running simplified test suite for PHP " . PHP_VERSION . "\n\n";

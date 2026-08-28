@@ -8,7 +8,7 @@
  * @copyright Copyright (c) 2015-2017
  * @license   http://opensource.org/licenses/gpl-3.0.html GNU Public License
  * @link      http://github.com/joshcam/PHP-MySQLi-Database-Class
- * @version   2.9-master
+ * @version   2.10.0
  *
  * @method int count ()
  * @method dbObject ArrayBuilder()
@@ -27,7 +27,7 @@
  * @method dbObject where($whereProp, $whereValue = 'DBNULL', $operator = '=', $cond = 'AND')
  * @method dbObject orWhere($whereProp, $whereValue = 'DBNULL', $operator = '=')
  * @method dbObject having($havingProp, $havingValue = 'DBNULL', $operator = '=', $cond = 'AND')
- * @method dbObject orHaving($havingProp, $havingValue = null, $operator = null)
+ * @method dbObject orHaving($havingProp, $havingValue = 'DBNULL', $operator = '=')
  * @method dbObject setQueryOption($options)
  * @method dbObject setTrace($enabled, $stripPrefix = null)
  * @method dbObject withTotalCount()
@@ -56,7 +56,7 @@ class dbObject {
      *
      * @var array
      */
-    public $data;
+    public $data = array();
     /**
      * Flag to define is object is new or loaded from database
      *
@@ -119,10 +119,60 @@ class dbObject {
     protected $toSkip = array();
 
     /**
+     * Field definitions used for validation and for deciding which properties are
+     * persisted. Models override this; see dbObject.md.
+     *
+     * @var array|null
+     */
+    protected $dbFields = null;
+
+    /**
+     * hasOne / hasMany relation definitions. Overridden by models.
+     *
+     * @var array
+     */
+    protected $relations = array();
+
+    /**
+     * Column names that must not be readable or writable through the -> operator.
+     *
+     * @var array
+     */
+    protected $hidden = array();
+
+    /**
+     * Columns that are automatically maintained: 'createdAt' and/or 'updatedAt'.
+     *
+     * @var array
+     */
+    protected $timestamps = array();
+
+    /**
+     * Columns serialised to JSON on save and decoded on load.
+     *
+     * @var array
+     */
+    protected $jsonFields = array();
+
+    /**
+     * Columns stored pipe delimited on save and exploded on load.
+     *
+     * @var array
+     */
+    protected $arrayFields = array();
+
+    /**
      * @param array $data Data to preload on object creation
+     *
+     * @throws Exception when no MysqliDb instance has been created yet
      */
     public function __construct ($data = null) {
         $this->db = MysqliDb::getInstance();
+
+        if (!$this->db instanceof MysqliDb) {
+            throw new Exception('dbObject requires a MysqliDb instance. Create one before instantiating models.');
+        }
+
         if (empty ($this->dbTable))
             $this->dbTable = get_class ($this);
 
@@ -136,9 +186,9 @@ class dbObject {
      * @return mixed
      */
     public function __set ($name, $value) {
-        if (property_exists ($this, 'hidden') && array_search ($name, $this->hidden) !== false)
+        if (in_array ($name, (array) $this->hidden, true))
             return;
-	    
+
         $this->data[$name] = $value;
     }
 
@@ -150,28 +200,30 @@ class dbObject {
      * @return mixed
      */
     public function __get ($name) {
-        if (property_exists ($this, 'hidden') && array_search ($name, $this->hidden) !== false)
-	    return null;
-		
-	if (isset ($this->data[$name]) && $this->data[$name] instanceof dbObject)
+        if (in_array ($name, (array) $this->hidden, true))
+            return null;
+
+        if (isset ($this->data[$name]) && $this->data[$name] instanceof dbObject)
             return $this->data[$name];
 
-        if (property_exists ($this, 'relations') && isset ($this->relations[$name])) {
+        if (isset ($this->relations[$name])) {
             $relationType = strtolower ($this->relations[$name][0]);
             $modelName = $this->relations[$name][1];
             switch ($relationType) {
                 case 'hasone':
                     $key = isset ($this->relations[$name][2]) ? $this->relations[$name][2] : $name;
+                    if (!array_key_exists ($key, $this->data))
+                        return null;
                     $obj = new $modelName;
                     $obj->returnType = $this->returnType;
                     return $this->data[$name] = $obj->byId($this->data[$key]);
-                    break;
                 case 'hasmany':
                     $key = $this->relations[$name][2];
+                    if (!array_key_exists ($this->primaryKey, $this->data))
+                        return null;
                     $obj = new $modelName;
                     $obj->returnType = $this->returnType;
                     return $this->data[$name] = $obj->where($key, $this->data[$this->primaryKey])->get();
-                    break;
                 default:
                     break;
             }
@@ -182,14 +234,15 @@ class dbObject {
 
         if (property_exists ($this->db, $name))
             return $this->db->$name;
+
+        return null;
     }
 
     public function __isset ($name) {
         if (isset ($this->data[$name]))
-            return isset ($this->data[$name]);
+            return true;
 
-        if (property_exists ($this->db, $name))
-            return isset ($this->db->$name);
+        return property_exists ($this->db, $name) && isset ($this->db->$name);
     }
 
     public function __unset ($name) {
@@ -235,8 +288,16 @@ class dbObject {
      */
     public static function table ($tableName) {
         $tableName = preg_replace ("/[^-a-z0-9_]+/i",'', $tableName);
+
+        // The name becomes a class name, so it has to be a valid PHP identifier. The
+        // filter above still allows a leading digit or hyphen, which would make the
+        // generated class definition a parse error.
+        if (!preg_match ('/^[A-Za-z_][A-Za-z0-9_]*$/', $tableName))
+            throw new Exception ("Invalid table name for a virtual model: " . $tableName);
+
         if (!class_exists ($tableName))
             eval ("class $tableName extends dbObject {}");
+
         return new $tableName ();
     }
     /**
@@ -429,6 +490,9 @@ class dbObject {
                 $objects[$k] = $item;
             }
         }
+        // Break the loop's reference so a later write cannot clobber the last row.
+        unset ($r);
+
         $this->_with = Array();
         if ($this->returnType == 'Object')
             return $objects;
@@ -448,8 +512,8 @@ class dbObject {
      * @return dbObject
      */
     private function with ($objectName) {
-        if (!property_exists ($this, 'relations') || !isset ($this->relations[$objectName]))
-            die ("No relation with name $objectName found");
+        if (!isset ($this->relations[$objectName]))
+            throw new Exception ("No relation with name " . $objectName . " found");
 
         $this->_with[MysqliDb::$prefix.$objectName] = $this->relations[$objectName];
 
@@ -523,6 +587,9 @@ class dbObject {
                 $objects[$k] = $item;
             }
         }
+        // Break the loop's reference so a later write cannot clobber the last row.
+        unset ($r);
+
         $this->_with = Array();
         if ($this->returnType == 'Object')
             return $objects;
@@ -547,8 +614,16 @@ class dbObject {
         if (method_exists ($this, $method))
             return call_user_func_array (array ($this, $method), $arg);
 
-        call_user_func_array (array ($this->db, $method), $arg);
-        return $this;
+        $result = call_user_func_array (array ($this->db, $method), $arg);
+
+        // MysqliDb returns itself from its chainable builder methods (where, orderBy,
+        // ...), and nothing at all from a few others. Keep the model fluent in those
+        // cases, but pass real return values through: this method used to discard them,
+        // so calls like getLastError() answered with the dbObject instead of the error.
+        if ($result === null || $result instanceof MysqliDb)
+            return $this;
+
+        return $result;
     }
 
     /**
@@ -575,12 +650,16 @@ class dbObject {
      * @return array Converted data
      */
     public function toArray () {
-        $data = $this->data;
+        $data = (array) $this->data;
         $this->processAllWith ($data);
         foreach ($data as &$d) {
             if ($d instanceof dbObject)
                 $d = $d->data;
         }
+        // Break the reference the loop leaves behind, otherwise the next write to $d
+        // (or a later foreach reusing the name) silently overwrites the last element.
+        unset ($d);
+
         return $data;
     }
 
@@ -622,8 +701,8 @@ class dbObject {
                 if (!isset ($data[$table])) {
                     $data[$name] = $this->$name;
                     continue;
-                } 
-                if ($data[$table][$primaryKey] === null) {
+                }
+                if (!isset ($data[$table][$primaryKey]) || $data[$table][$primaryKey] === null) {
                     $data[$name] = null;
                 } else {
                     if ($this->returnType == 'Object') {
@@ -667,13 +746,18 @@ class dbObject {
      * @param array $data
      */
     private function processArrays (&$data) {
-        if (isset ($this->jsonFields) && is_array ($this->jsonFields)) {
-            foreach ($this->jsonFields as $key)
+        if (!is_array ($data))
+            return;
+
+        // Only convert columns that are actually present: a get() restricted to a subset
+        // of fields would otherwise raise "undefined array key" for the rest.
+        foreach ((array) $this->jsonFields as $key) {
+            if (isset ($data[$key]) && is_string ($data[$key]))
                 $data[$key] = json_decode ($data[$key]);
         }
 
-        if (isset ($this->arrayFields) && is_array($this->arrayFields)) {
-            foreach ($this->arrayFields as $key)
+        foreach ((array) $this->arrayFields as $key) {
+            if (isset ($data[$key]) && is_string ($data[$key]))
                 $data[$key] = explode ("|", $data[$key]);
         }
     }
@@ -684,6 +768,9 @@ class dbObject {
     private function validate ($data) {
         if (!$this->dbFields)
             return true;
+
+        if (!is_array ($this->errors))
+            $this->errors = Array ();
 
         foreach ($this->dbFields as $key => $desc) {
         	if(in_array($key, $this->toSkip))
@@ -704,11 +791,14 @@ class dbObject {
             if (isset ($desc[1]) && ($desc[1] == 'required'))
                 $required = true;
 
-            if ($required && strlen ($value) == 0) {
+            // strlen(null) is deprecated as of PHP 8.1.
+            if ($required && ($value === null || strlen ((string) $value) == 0)) {
                 $this->errors[] = Array ($this->dbTable . "." . $key => "is required");
                 continue;
             }
-            if ($value == null)
+            // Falsy values (null, '', 0, '0', false) are not validated further. This
+            // matches the original `$value == null` test, without its null deprecation.
+            if (!$value)
                 continue;
 
             switch ($type) {
@@ -734,18 +824,24 @@ class dbObject {
             if (!$regexp)
                 continue;
 
-            if (!preg_match ($regexp, $value)) {
+            if (!preg_match ($regexp, (string) $value)) {
                 $this->errors[] = Array ($this->dbTable . "." . $key => "$type validation failed");
                 continue;
             }
         }
-        return !count ($this->errors) > 0;
+
+        // NB: this used to read `return !count($this->errors) > 0;`, which parses as
+        // `(!count(...)) > 0` and only worked by accident.
+        return count ($this->errors) === 0;
     }
 
     private function prepareData () {
         $this->errors = Array ();
         $sqlData = Array();
-        if (count ($this->data) == 0)
+
+        // count(null) is a TypeError in PHP 8, which made insert() fatal on an object
+        // that had no properties set yet.
+        if (empty ($this->data))
             return Array();
 
         if (method_exists ($this, "preLoad"))
@@ -774,13 +870,15 @@ class dbObject {
                 continue;
             }
 
-            if (isset ($this->jsonFields) && in_array ($key, $this->jsonFields))
+            if (in_array ($key, (array) $this->jsonFields))
                 $sqlData[$key] = json_encode($value);
-            else if (isset ($this->arrayFields) && in_array ($key, $this->arrayFields))
+            else if (in_array ($key, (array) $this->arrayFields))
                 $sqlData[$key] = implode ("|", $value);
             else
                 $sqlData[$key] = $value;
         }
+        unset ($value);
+
         return $sqlData;
     }
 
