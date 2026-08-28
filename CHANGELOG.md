@@ -104,8 +104,6 @@ These are fixes, but they change what existing code sees. Read them before upgra
 
 * PHPUnit suite: `tests/unit` (156 tests, no database required) and `tests/integration`
   (29 tests, skipped unless `DB_HOST`/`DB_NAME` are set).
-* GitHub Actions workflow running lint and unit tests on PHP 8.3/8.4, and the integration
-  suite against MySQL 8.0.
 * `composer test`, `composer test-unit`, `composer test-integration`.
 
 ### Changed
