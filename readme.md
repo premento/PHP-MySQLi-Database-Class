@@ -55,7 +55,7 @@ require_once ('MysqliDb.php');
 ### Installation with composer
 It is also possible to install library via composer
 ```
-composer require thingengineer/mysqli-database-class:dev-master
+composer require premento/mysqli-database-class
 ```
 
 ### Initialization
