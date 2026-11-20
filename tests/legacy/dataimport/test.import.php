@@ -1,7 +1,7 @@
 <?php
 // TEST HAS BEEN DONE USING PHP 7.0
 // Basic Stuff
-error_reporting (E_ALL|E_STRICT);
+error_reporting (E_ALL); // E_STRICT is deprecated as of PHP 8.4; E_ALL already covers it
 require_once (__DIR__ . "/../../../MysqliDb.php");
 require_once (__DIR__ . "/../../../dbObject.php");
 // Create database context

@@ -37,6 +37,12 @@ class FakeMysqli
     /** @var mixed Return value for query(). */
     public $queryResult = true;
 
+    /**
+     * @var string|null When set, query() throws mysqli_sql_exception with this message,
+     *                  emulating the PHP 8.1+ default error mode.
+     */
+    public $queryThrows = null;
+
     /** @var string[] Queries passed to prepare(). */
     public $preparedQueries = array();
 
@@ -55,6 +61,10 @@ class FakeMysqli
     public function query($query)
     {
         $this->unpreparedQueries[] = $query;
+
+        if ($this->queryThrows !== null) {
+            throw new mysqli_sql_exception($this->queryThrows, $this->errno);
+        }
 
         return $this->queryResult;
     }
@@ -118,10 +128,9 @@ class FakeMysqli
         return true;
     }
 
-    public function ping()
-    {
-        return true;
-    }
+    // NB: no ping() stub. mysqli::ping() is deprecated as of PHP 8.4, and MysqliDb::ping()
+    // now probes the connection with a plain query instead. Leaving the stub out means any
+    // reintroduction of the deprecated call fails loudly here rather than passing silently.
 
     public function set_charset($charset)
     {

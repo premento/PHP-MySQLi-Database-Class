@@ -287,7 +287,6 @@ class DbObjectTest extends ModelTestCase
     public function testConstructorFailsClearlyWithoutAMysqliDbInstance()
     {
         $property = new ReflectionProperty(MysqliDb::class, '_instance');
-        $property->setAccessible(true);
         $previous = $property->getValue();
         $property->setValue(null, null);
 

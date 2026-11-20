@@ -105,13 +105,11 @@ class RegressionGuardTest extends BuilderTestCase
     public function testSelectIsNotTreatedAsAnInsert()
     {
         $method = new ReflectionMethod(MysqliDb::class, '_buildInsertQuery');
-        $method->setAccessible(true);
 
         $this->db->startQuery('SELECT * FROM users');
         $method->invoke($this->db, array('login' => 'demo'));
 
         $property = new ReflectionProperty(MysqliDb::class, '_query');
-        $property->setAccessible(true);
 
         $this->assertStringContainsString('SET', $property->getValue($this->db));
         $this->assertStringNotContainsString('VALUES', $property->getValue($this->db));
@@ -120,13 +118,11 @@ class RegressionGuardTest extends BuilderTestCase
     public function testInsertIsStillDetectedWithLeadingWhitespace()
     {
         $method = new ReflectionMethod(MysqliDb::class, '_buildInsertQuery');
-        $method->setAccessible(true);
 
         $this->db->startQuery('  INSERT INTO users');
         $method->invoke($this->db, array('login' => 'demo'));
 
         $property = new ReflectionProperty(MysqliDb::class, '_query');
-        $property->setAccessible(true);
 
         $this->assertStringContainsString('VALUES', $property->getValue($this->db));
     }
