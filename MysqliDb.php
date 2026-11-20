@@ -1271,7 +1271,9 @@ class MysqliDb
     public function join($joinTable, $joinCondition, $joinType = '')
     {
         $allowedTypes = array('LEFT', 'RIGHT', 'OUTER', 'INNER', 'LEFT OUTER', 'RIGHT OUTER', 'NATURAL');
-        $joinType = strtoupper(trim($joinType));
+        // Cast explicitly: passing null to trim() is deprecated as of PHP 8.1, and callers
+        // routinely forward a nullable config value here.
+        $joinType = strtoupper(trim((string) $joinType));
 
         if ($joinType && !in_array($joinType, $allowedTypes)) {
             throw new Exception('Wrong JOIN type: ' . $joinType);
@@ -1426,7 +1428,8 @@ class MysqliDb
     public function orderBy($orderByField, $orderbyDirection = "DESC", $customFieldsOrRegExp = null)
     {
         $allowedDirection = Array("ASC", "DESC");
-        $orderbyDirection = strtoupper(trim($orderbyDirection));
+        // Cast explicitly: passing null to trim() is deprecated as of PHP 8.1.
+        $orderbyDirection = strtoupper(trim((string) $orderbyDirection));
         $orderByField = preg_replace("/[^ -a-z0-9\.\(\),_`\*\'\"]+/i", '', $orderByField);
 
         // Add table prefix to orderByField if needed.
@@ -1624,17 +1627,29 @@ class MysqliDb
     }
 
     /**
-     * Method to call mysqli->ping() to keep unused connections open on
-     * long-running scripts, or to reconnect timed out connections (if php.ini has
-     * global mysqli.reconnect set to true). Can't do this directly using object
-     * since _mysqli is protected.
+     * Probe the connection, to keep it open on long-running scripts.
+     *
+     * mysqli::ping() is deprecated as of PHP 8.4: the reconnect feature it existed for
+     * was dropped in PHP 8.2, which left it as a plain round trip to the server. The
+     * cheapest such round trip is used here instead, so the method keeps working on
+     * PHP 8.4+ without emitting a deprecation. "DO" evaluates its argument and returns
+     * no result set, so there is nothing to free afterwards.
+     *
+     * A connection that cannot be established still throws, as before; a connection
+     * that is established but no longer usable reports false.
      *
      * @return bool True if connection is up
      * @throws Exception
      */
     public function ping()
     {
-        return $this->mysqli()->ping();
+        $mysqli = $this->mysqli();
+
+        $result = $this->_muteMysqliError(function () use ($mysqli) {
+            return $mysqli->query('DO 1');
+        });
+
+        return $result !== false;
     }
 
     /**
@@ -1918,12 +1933,22 @@ class MysqliDb
             }
             $this->count++;
             if ($this->_mapKey) {
+                // A NULL in the mapped column would be used as an array offset, which PHP
+                // deprecated in 8.5. PHP has always folded a null key to the empty string,
+                // so the same key is produced explicitly here and the row still lands where
+                // it used to. A column that is missing altogether is left alone: that is a
+                // caller error, and its undefined-key warning should keep surfacing.
+                $mapKey = $row[$this->_mapKey];
+                if ($mapKey === null) {
+                    $mapKey = '';
+                }
+
                 if (count($row) < 3 && $this->returnType == 'object') {
                     $res = new ArrayIterator($result);
                     $res->seek($res->count() - 1);
-                    $results[$row[$this->_mapKey]] = $res->current();
+                    $results[$mapKey] = $res->current();
                 }
-                else $results[$row[$this->_mapKey]] = count($row) > 2 ? $result : end($result);
+                else $results[$mapKey] = count($row) > 2 ? $result : end($result);
             } else {
                 array_push($results, $result);
             }

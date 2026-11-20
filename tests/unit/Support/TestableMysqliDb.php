@@ -27,6 +27,17 @@ class TestableMysqliDb extends MysqliDb
     /** @var string|null When set, the next execute() throws mysqli_sql_exception. */
     public $nextExecuteThrows = null;
 
+    /**
+     * Rows the next statement serves, as a list of column => value maps. Leave it null
+     * for the builder-only tests, which want a statement with no result set.
+     *
+     * @var array|null
+     */
+    public $nextResultRows = null;
+
+    /** @var string Table name reported for every column of those rows. */
+    public $nextResultTable = '';
+
     public function __construct($host = null, $username = null, $password = null, $db = null, $port = null, $charset = 'utf8', $socket = null)
     {
         parent::__construct($host, $username, $password, $db, $port, $charset, $socket);
@@ -50,6 +61,8 @@ class TestableMysqliDb extends MysqliDb
         $stmt->insert_id = $this->nextInsertId;
         $stmt->executeResult = $this->nextExecuteResult;
         $stmt->throwOnExecute = $this->nextExecuteThrows;
+        $stmt->resultRows = $this->nextResultRows;
+        $stmt->resultTable = $this->nextResultTable;
 
         $this->statements[] = $stmt;
 

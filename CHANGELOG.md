@@ -102,9 +102,38 @@ These are fixes, but they change what existing code sees. Read them before upgra
 
 ### Added
 
-* PHPUnit suite: `tests/unit` (156 tests, no database required) and `tests/integration`
+* PHPUnit suite: `tests/unit` (163 tests, no database required) and `tests/integration`
   (29 tests, skipped unless `DB_HOST`/`DB_NAME` are set).
 * `composer test`, `composer test-unit`, `composer test-integration`.
+* `tests/unit/Php86CompatibilityTest.php`, covering the constructs PHP deprecated between
+  8.4 and 8.6. The suite runs with `failOnDeprecation="true"`, so a reintroduced
+  deprecation fails the build.
+* The unit stubs can now serve a result set (`FakeStatement::$resultRows` and
+  `FakeResultMetadata`), so the row-mapping code is reachable without a database.
+
+### PHP 8.6 compatibility
+
+* **`ping()` no longer calls `mysqli::ping()`**, which PHP deprecated in 8.4 after the
+  reconnect feature it existed for was dropped in 8.2. It now probes the connection with
+  a `DO 1` round trip. The signature and return value are unchanged: a connection that
+  cannot be established still throws, and one that is established but unusable returns
+  `false`. Code that counts queries against the server will see this extra statement.
+* **`map()` no longer uses a NULL column value as an array offset**, deprecated in PHP
+  8.5. PHP has always folded a null key to `''`, so such a row still lands under the empty
+  string key; only the deprecation notice is gone. A mapped column that is missing from
+  the result set still warns, as before.
+* `join()` and `orderBy()` cast their optional string argument before `trim()`, so passing
+  `null` no longer triggers the PHP 8.1 null-to-internal-argument deprecation. This
+  matches what `setLockMethod()` already did.
+* `tests/legacy/dataimport/test.import.php` no longer references `E_STRICT`, deprecated in
+  PHP 8.4 and already covered by `E_ALL`.
+* The unit tests dropped their `ReflectionMethod::setAccessible()` /
+  `ReflectionProperty::setAccessible()` calls, deprecated in PHP 8.5. They have had no
+  effect since PHP 8.1, which is well below this package's floor.
+
+Verified against PHP 8.5.4: the full suite runs with no deprecations and no failures.
+PHP 8.6 was not available to run here, so the 8.6-specific items above were checked
+against the `UPGRADING` file on the php-src `PHP-8.6` branch rather than executed.
 
 ### Changed
 

@@ -45,7 +45,6 @@ class ErrorHandlingTest extends BuilderTestCase
     public function testPlaceholderAtOffsetZeroIsReplaced()
     {
         $method = new ReflectionMethod(MysqliDb::class, 'replacePlaceHolders');
-        $method->setAccessible(true);
 
         $this->assertSame("'a' = x", $method->invoke($this->db, '? = x', array('', 'a')));
     }
@@ -56,7 +55,6 @@ class ErrorHandlingTest extends BuilderTestCase
     public function testMorePlaceholdersThanValuesDoesNotOverrun()
     {
         $method = new ReflectionMethod(MysqliDb::class, 'replacePlaceHolders');
-        $method->setAccessible(true);
 
         $this->assertSame("x = 'a' AND y = ?", $method->invoke($this->db, 'x = ? AND y = ?', array('', 'a')));
     }
@@ -64,7 +62,6 @@ class ErrorHandlingTest extends BuilderTestCase
     public function testNullValuesAreRenderedAsNullInTheDebugQuery()
     {
         $method = new ReflectionMethod(MysqliDb::class, 'replacePlaceHolders');
-        $method->setAccessible(true);
 
         $this->assertSame("x = 'NULL'", $method->invoke($this->db, 'x = ?', array('', null)));
     }
@@ -136,7 +133,6 @@ class ErrorHandlingTest extends BuilderTestCase
     public function testUnsupportedBindTypeIsRejectedEarly()
     {
         $method = new ReflectionMethod(MysqliDb::class, '_determineType');
-        $method->setAccessible(true);
 
         $this->expectException(Exception::class);
         $this->expectExceptionMessage('Unsupported bind parameter type: array');
@@ -159,7 +155,6 @@ class ErrorHandlingTest extends BuilderTestCase
     public function testDetermineTypeMapping()
     {
         $method = new ReflectionMethod(MysqliDb::class, '_determineType');
-        $method->setAccessible(true);
 
         $this->assertSame('s', $method->invoke($this->db, 'text'));
         $this->assertSame('s', $method->invoke($this->db, null));
@@ -219,7 +214,6 @@ class ErrorHandlingTest extends BuilderTestCase
 
         // Simulate a live connection without needing a server.
         $property = new ReflectionProperty(MysqliDb::class, '_mysqli');
-        $property->setAccessible(true);
         $property->setValue($db, array('default' => new FakeMysqli()));
 
         $copy = $db->copy();

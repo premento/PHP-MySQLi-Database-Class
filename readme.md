@@ -38,12 +38,21 @@ Everyone's time should be valuable, so please consider donating.
 [Donate with paypal](https://www.paypal.com/cgi-bin/webscr?cmd=_donations&business=a%2ebutenka%40gmail%2ecom&lc=DO&item_name=mysqlidb&currency_code=USD&bn=PP%2dDonationsBF%3abtn_donateCC_LG%2egif%3aNonHosted)
 
 ### Requirements
-* PHP 8.3 or newer
+* PHP 8.3 or newer, up to and including PHP 8.6
 * The `mysqli` extension
 
 Since PHP 8.1, mysqli reports errors by throwing `mysqli_sql_exception` rather than
 returning `false`. This library handles both modes internally and always surfaces
 failures as its own `Exception`, so you do not need to call `mysqli_report()` yourself.
+
+The code is free of the features PHP deprecated through 8.6. The suite runs with
+`failOnDeprecation="true"`, so a runtime deprecation reached from `MysqliDb.php` or
+`dbObject.php` fails the build. Compile-time deprecations are not caught that way, since
+they fire while the class is being autoloaded rather than inside a test; `php -l` and a
+run under the newest PHP available are still worth doing before a release.
+
+Note that `ping()` no longer calls `mysqli::ping()`, deprecated in PHP 8.4; see the entry
+in `CHANGELOG.md`.
 
 ### Installation
 To utilize this class, first import MysqliDb.php into your project, and require it.
@@ -809,6 +818,9 @@ Reconnect in case mysql connection died:
 if (!$db->ping())
     $db->connect()
 ```
+`ping()` probes the connection with a `DO 1` round trip, because `mysqli::ping()` is
+deprecated as of PHP 8.4. It returns `false` for a connection that is established but no
+longer usable, and throws when no connection can be made at all.
 
 Get last executed SQL query:
 Please note that this method returns the SQL query only for debugging purposes as its execution most likely will fail due to missing quotes around char variables.

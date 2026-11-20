@@ -89,7 +89,6 @@ class InsertMultiTest extends BuilderTestCase
     public function testShutdownHandlerIsRegisteredOnlyOnce()
     {
         $property = new ReflectionProperty(MysqliDb::class, '_shutdownHandlerRegistered');
-        $property->setAccessible(true);
 
         $this->db->startTransaction();
         $this->assertTrue($property->getValue($this->db));
@@ -106,7 +105,6 @@ class InsertMultiTest extends BuilderTestCase
     public function testCommitAndRollbackClearTheInProgressFlag()
     {
         $property = new ReflectionProperty(MysqliDb::class, '_transaction_in_progress');
-        $property->setAccessible(true);
 
         $this->db->startTransaction();
         $this->assertTrue($property->getValue($this->db));
